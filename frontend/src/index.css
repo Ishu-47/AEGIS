@@ -4,5 +4,161 @@
   --color-ivory: #F4EFE6;
   --color-surface: #E5D9CB;
   --color-oxblood: #7B2638;
+  --color-oxblood-dark: #5E1D2B;
   --color-ink: #292322;
+  --color-success: #2D6A4F;
+  --color-warning: #B8860B;
+  --color-danger: #9B2226;
+
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Code', monospace;
 }
+
+/* Base resets */
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--color-ivory);
+  color: var(--color-ink);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(41, 35, 34, 0.2);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(41, 35, 34, 0.35);
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(-12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes pulse-subtle {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.35s ease-out both;
+}
+
+.animate-slide-in {
+  animation: slideIn 0.3s ease-out both;
+}
+
+.animate-pulse-subtle {
+  animation: pulse-subtle 2s ease-in-out infinite;
+}
+
+/* Skeleton loader */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    rgba(41, 35, 34, 0.06) 25%,
+    rgba(41, 35, 34, 0.12) 50%,
+    rgba(41, 35, 34, 0.06) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 6px;
+}
+
+/* Severity badges */
+.severity-critical,
+.severity-fatal {
+  background: rgba(155, 34, 38, 0.12);
+  color: #9B2226;
+}
+
+.severity-error {
+  background: rgba(123, 38, 56, 0.12);
+  color: #7B2638;
+}
+
+.severity-warn {
+  background: rgba(184, 134, 11, 0.12);
+  color: #8B6914;
+}
+
+.severity-info {
+  background: rgba(41, 35, 34, 0.08);
+  color: rgba(41, 35, 34, 0.7);
+}
+
+.severity-debug {
+  background: rgba(41, 35, 34, 0.05);
+  color: rgba(41, 35, 34, 0.5);
+}
+
+/* Status badges */
+.status-open {
+  background: rgba(155, 34, 38, 0.1);
+  color: #9B2226;
+  border: 1px solid rgba(155, 34, 38, 0.2);
+}
+
+.status-investigating,
+.status-investigated {
+  background: rgba(184, 134, 11, 0.1);
+  color: #8B6914;
+  border: 1px solid rgba(184, 134, 11, 0.2);
+}
+
+.status-resolved {
+  background: rgba(45, 106, 79, 0.1);
+  color: #2D6A4F;
+  border: 1px solid rgba(45, 106, 79, 0.2);
+}
+
+.status-dismissed {
+  background: rgba(41, 35, 34, 0.06);
+  color: rgba(41, 35, 34, 0.5);
+  border: 1px solid rgba(41, 35, 34, 0.1);
+}
+
+/* Confidence meter */
+.confidence-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(41, 35, 34, 0.08);
+  overflow: hidden;
+}
+
+.confidence-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.6s ease-out;
+}
+
+.confidence-low { background: #9B2226; }
+.confidence-medium { background: #B8860B; }
+.confidence-high { background: #2D6A4F; }
