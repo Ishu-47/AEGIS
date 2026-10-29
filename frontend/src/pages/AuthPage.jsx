@@ -48,14 +48,14 @@ export default function AuthPage({ mode }) {
 
         <section className="rounded-2xl border border-ink/10 bg-white/60 p-7 shadow-sm sm:p-8">
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-oxblood">
-            {isRegister ? "First-time setup" : "Secure workspace"}
+            {isRegister ? "Create workspace account" : "Secure workspace"}
           </p>
           <h1 className="mt-2 text-2xl font-semibold">
-            {isRegister ? "Create your owner account" : "Welcome back"}
+            {isRegister ? "Create your account" : "Welcome back"}
           </h1>
           <p className="mt-2 text-sm leading-6 text-ink/55">
             {isRegister
-              ? "Create the single dashboard owner account. Application ingestion keys remain separate."
+              ? "Create an account to manage your own applications. Application ingestion keys remain separate."
               : "Sign in to manage applications, review incidents, and investigate errors."}
           </p>
 
@@ -116,11 +116,11 @@ export default function AuthPage({ mode }) {
 
           <p className="mt-5 text-center text-sm text-ink/55">
             {isRegister ? (
-              <>Already configured? <Link to="/login" className="font-semibold text-oxblood hover:underline">Sign in</Link></>
+              <>Already have an account? <Link to="/login" className="font-semibold text-oxblood hover:underline">Sign in</Link></>
             ) : registrationAvailable ? (
-              <>First time here? <Link to="/register" className="font-semibold text-oxblood hover:underline">Create the owner account</Link></>
+              <>New to AEGIS? <Link to="/register" className="font-semibold text-oxblood hover:underline">Create an account</Link></>
             ) : (
-              "Dashboard access is limited to the configured owner account."
+              "Your applications are private to your account."
             )}
           </p>
         </section>

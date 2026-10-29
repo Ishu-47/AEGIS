@@ -151,9 +151,7 @@ function AppRoutes() {
           element={
             authenticated
               ? <Navigate to="/" replace />
-              : registrationAvailable
-                ? <AuthPage mode="register" />
-                : <Navigate to="/login" replace />
+              : <AuthPage mode="register" />
           }
         />
         <Route
