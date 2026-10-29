@@ -120,9 +120,7 @@ class Incident(Base):
 class IncidentEvent(Base):
     __tablename__ = "incident_events"
 
-    __table_args__ = (UniqueConstraint(
-        "incident_id", "log_event_id", name="uq_incident_log_event",
-    ),)
+    
 
     incident_id: Mapped[int] = mapped_column(
         ForeignKey("incidents.id", ondelete="CASCADE"),
