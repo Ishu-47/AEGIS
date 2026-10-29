@@ -10,3 +10,5 @@ target/
 .idea/
 .vscode/
 **/.env
+# Ignore backend's environment example
+/backend/.env.example

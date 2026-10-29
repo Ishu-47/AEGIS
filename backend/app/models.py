@@ -30,6 +30,12 @@ class Application(Base):
         default="",
         nullable=False,
     )
+    platform: Mapped[str] = mapped_column(
+        String(50),
+        default="Other",
+        server_default="Other",
+        nullable=False,
+    )
     api_key_hash: Mapped[str] = mapped_column(
         String(64),
         unique=True,
@@ -171,4 +177,49 @@ class InvestigationReport(Base):
 
     incident: Mapped["Incident"] = relationship(
         back_populates="report",
+    )
+
+
+
+class User(Base):
+    """Single dashboard owner account for the current single-tenant MVP."""
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
+
+class UserSession(Base):
+    """Opaque, server-managed dashboard session; only a token hash is stored."""
+    __tablename__ = "user_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    token_hash: Mapped[str] = mapped_column(
+        String(64),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+    csrf_token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
     )
