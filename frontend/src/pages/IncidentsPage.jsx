@@ -5,23 +5,39 @@ import { fetchIncidents } from "../api/aegis";
 import { AlertTriangle, ArrowRight, Loader2 } from "lucide-react";
 
 export default function IncidentsPage() {
-  const { selected } = useApp();
+  const { selected, applications, allApplicationsSelected } = useApp();
   const [incidents, setIncidents] = useState([]);
   const [loading, setLoading] = useState(false);
   const [filter, setFilter] = useState("all");
 
   useEffect(() => {
-    if (!selected) {
+    if (allApplicationsSelected) {
+      setLoading(true);
+      Promise.all(
+        applications.map((app) =>
+          fetchIncidents(app.id)
+            .then((data) => data?.incidents || [])
+            .catch(() => []),
+        ),
+      )
+        .then((lists) => setIncidents(
+          lists.flat().sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen)),
+        ))
+        .finally(() => setLoading(false));
+      return;
+    }
+
+    if (!selected && !allApplicationsSelected) {
       setIncidents([]);
       return;
     }
 
     setLoading(true);
-    fetchIncidents(selected.id, selected.api_key)
+    fetchIncidents(selected.id)
       .then((data) => setIncidents(data?.incidents || []))
       .catch(() => setIncidents([]))
       .finally(() => setLoading(false));
-  }, [selected?.id]);
+  }, [selected?.id, allApplicationsSelected, applications]);
 
   const filtered =
     filter === "all"
@@ -37,7 +53,7 @@ export default function IncidentsPage() {
     resolved: incidents.filter((i) => i.status === "resolved").length,
   };
 
-  if (!selected) {
+  if (!selected && !allApplicationsSelected) {
     return (
       <div className="py-20 text-center animate-fade-in">
         <p className="text-sm text-ink/50">
@@ -55,7 +71,9 @@ export default function IncidentsPage() {
         </p>
         <h2 className="mt-2 text-xl font-semibold">Incidents</h2>
         <p className="mt-1 text-sm text-ink/55">
-          Grouped errors and their investigation status.
+          {allApplicationsSelected
+            ? `Grouped errors across ${applications.length} applications.`
+            : "Grouped errors and their investigation status."}
         </p>
       </div>
 
@@ -143,7 +161,9 @@ export default function IncidentsPage() {
                   {incident.title}
                 </p>
                 <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-ink/50">
-                  <span>{incident.service}</span>
+                  <span>{allApplicationsSelected ? applications.find((app) => app.id === incident.application_id)?.name || "Application" : incident.service}</span>
+                  {allApplicationsSelected && <span>·</span>}
+                  {allApplicationsSelected && <span>{incident.service}</span>}
                   <span>·</span>
                   <span>{incident.event_count} events</span>
                   <span>·</span>

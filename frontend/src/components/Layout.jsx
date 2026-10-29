@@ -1,4 +1,4 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useApp } from "../App";
 import {
   Shield,
@@ -6,6 +6,8 @@ import {
   AlertTriangle,
   Code2,
   ChevronDown,
+  Layers,
+  LogOut,
 } from "lucide-react";
 import { useState } from "react";
 import RegisterModal from "./RegisterModal";
@@ -14,12 +16,22 @@ const navItems = [
   { to: "/", label: "Dashboard", icon: Shield, end: true },
   { to: "/ingest", label: "Ingest", icon: Upload },
   { to: "/incidents", label: "Incidents", icon: AlertTriangle },
+  { to: "/applications", label: "Applications", icon: Layers },
   { to: "/api-docs", label: "API", icon: Code2 },
 ];
 
 export default function Layout() {
-  const { applications, selectedId, setSelectedId, selected } = useApp();
+  const { applications, selectedId, setSelectedId, selected, allApplicationsSelected, email, logout } = useApp();
   const [showRegister, setShowRegister] = useState(false);
+  const navigate = useNavigate();
+
+  async function handleLogout() {
+    try {
+      await logout();
+    } finally {
+      navigate("/login", { replace: true });
+    }
+  }
 
   return (
     <div className="min-h-screen bg-ivory text-ink">
@@ -70,7 +82,10 @@ export default function Layout() {
                 onChange={(e) => setSelectedId(e.target.value)}
                 className="appearance-none rounded-lg border border-ink/12 bg-ivory pl-3 pr-8 py-2 text-sm font-medium outline-none transition focus:border-oxblood cursor-pointer"
               >
-                <option value="">Select application</option>
+                <option value="">
+                  {applications.length > 1 ? "Choose application" : "Select application"}
+                </option>
+                {applications.length > 1 && <option value="__all__">All applications</option>}
                 {applications.map((app) => (
                   <option key={app.id} value={app.id}>
                     {app.name}
@@ -88,6 +103,15 @@ export default function Layout() {
             >
               + New
             </button>
+            <div className="hidden items-center gap-2 lg:flex">
+              <span className="max-w-36 truncate text-xs text-ink/50" title={email}>{email}</span>
+              <button
+                onClick={handleLogout}
+                title="Sign out"
+                aria-label="Sign out"
+                className="rounded-lg border border-ink/12 p-2 text-ink/55 transition hover:bg-ink/5 hover:text-oxblood"
+              ><LogOut size={15} /></button>
+            </div>
           </div>
         </div>
 
@@ -110,12 +134,15 @@ export default function Layout() {
               {label}
             </NavLink>
           ))}
+          <button onClick={handleLogout} className="ml-auto flex shrink-0 items-center gap-1.5 border-b-2 border-transparent px-3 py-3 text-xs font-medium text-ink/50 hover:text-oxblood">
+            <LogOut size={13} /> Sign out
+          </button>
         </nav>
       </header>
 
       {/* Content */}
       <main className="mx-auto max-w-7xl px-6 py-8 md:px-10">
-        {!selected && (
+        {!selected && !allApplicationsSelected && (
           <div className="mb-6 rounded-xl border border-oxblood/20 bg-oxblood/5 px-5 py-4 animate-fade-in">
             <p className="text-sm font-medium text-oxblood">
               No application selected

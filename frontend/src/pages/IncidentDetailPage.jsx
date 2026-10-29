@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
-import { useApp } from "../App";
 import {
   fetchIncident,
   triggerInvestigation,
@@ -134,33 +133,28 @@ function ReportSection({ icon: Icon, title, children }) {
 
 export default function IncidentDetailPage() {
   const { id } = useParams();
-  const { selected } = useApp();
   const [incident, setIncident] = useState(null);
   const [loading, setLoading] = useState(true);
   const [investigating, setInvestigating] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (!selected) return;
-
     setLoading(true);
-    fetchIncident(parseInt(id), selected.api_key)
+    setError("");
+    fetchIncident(parseInt(id))
       .then(setIncident)
-      .catch(() => setError("Could not load incident."))
+      .catch((err) => setError(err.response?.data?.detail || "Could not load incident."))
       .finally(() => setLoading(false));
-  }, [id, selected?.id]);
+  }, [id]);
 
   async function handleInvestigate() {
     setInvestigating(true);
     setError("");
 
     try {
-      const data = await triggerInvestigation(
-        parseInt(id),
-        selected.api_key,
-      );
+      await triggerInvestigation(parseInt(id));
       // Refresh
-      const updated = await fetchIncident(parseInt(id), selected.api_key);
+      const updated = await fetchIncident(parseInt(id));
       setIncident(updated);
     } catch (err) {
       setError(
@@ -173,20 +167,12 @@ export default function IncidentDetailPage() {
 
   async function handleStatusChange(newStatus) {
     try {
-      await updateIncidentStatus(parseInt(id), newStatus, selected.api_key);
-      const updated = await fetchIncident(parseInt(id), selected.api_key);
+      await updateIncidentStatus(parseInt(id), newStatus);
+      const updated = await fetchIncident(parseInt(id));
       setIncident(updated);
     } catch {
       // silent
     }
-  }
-
-  if (!selected) {
-    return (
-      <div className="py-20 text-center text-sm text-ink/50">
-        Select an application to view incident details.
-      </div>
-    );
   }
 
   if (loading) {

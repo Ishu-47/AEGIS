@@ -24,7 +24,7 @@ function StatCard({ label, value, icon: Icon, color = "ink" }) {
   );
 }
 
-function IncidentRow({ incident }) {
+function IncidentRow({ incident, applicationName }) {
   const statusClass = `status-${incident.status}`;
 
   return (
@@ -38,7 +38,7 @@ function IncidentRow({ incident }) {
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-semibold">{incident.title}</p>
         <p className="mt-0.5 text-xs text-ink/50">
-          {incident.service} · {incident.event_count} events
+          {applicationName ? `${applicationName} · ` : ""}{incident.service} · {incident.event_count} events
         </p>
       </div>
       <div className="flex items-center gap-2">
@@ -54,12 +54,46 @@ function IncidentRow({ incident }) {
 }
 
 export default function DashboardPage() {
-  const { selected } = useApp();
+  const { selected, applications, allApplicationsSelected } = useApp();
   const [stats, setStats] = useState(null);
   const [incidents, setIncidents] = useState([]);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
+    if (allApplicationsSelected) {
+      setLoading(true);
+      Promise.all(
+        applications.map(async (app) => {
+          const [appStats, appIncidents] = await Promise.all([
+            fetchStats(app.id).catch(() => null),
+            fetchIncidents(app.id).catch(() => ({ incidents: [] })),
+          ]);
+          return { appStats, incidents: appIncidents?.incidents || [] };
+        }),
+      )
+        .then((results) => {
+          const totals = {
+            total_events: 0,
+            total_incidents: 0,
+            open_incidents: 0,
+            investigated_incidents: 0,
+            resolved_incidents: 0,
+          };
+          for (const result of results) {
+            for (const key of Object.keys(totals)) {
+              totals[key] += Number(result.appStats?.[key] || 0);
+            }
+          }
+          setStats(totals);
+          setIncidents(
+            results.flatMap((result) => result.incidents)
+              .sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen)),
+          );
+        })
+        .finally(() => setLoading(false));
+      return;
+    }
+
     if (!selected) {
       setStats(null);
       setIncidents([]);
@@ -67,30 +101,37 @@ export default function DashboardPage() {
     }
 
     setLoading(true);
-
     Promise.all([
-      fetchStats(selected.id, selected.api_key).catch(() => null),
-      fetchIncidents(selected.id, selected.api_key).catch(() => ({
-        incidents: [],
-      })),
-    ]).then(([s, i]) => {
-      setStats(s);
-      setIncidents(i?.incidents || []);
-      setLoading(false);
-    });
-  }, [selected?.id]);
+      fetchStats(selected.id).catch(() => null),
+      fetchIncidents(selected.id).catch(() => ({ incidents: [] })),
+    ])
+      .then(([appStats, appIncidents]) => {
+        setStats(appStats);
+        setIncidents(appIncidents?.incidents || []);
+      })
+      .finally(() => setLoading(false));
+  }, [selected?.id, allApplicationsSelected, applications]);
 
-  if (!selected) {
+  if (!selected && !allApplicationsSelected) {
+    const hasApps = applications.length > 0;
     return (
       <div className="flex flex-col items-center justify-center py-20 animate-fade-in">
         <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-oxblood/10">
           <Activity size={28} className="text-oxblood" />
         </div>
-        <h2 className="mt-6 text-xl font-semibold">Welcome to AEGIS</h2>
+        <h2 className="mt-6 text-xl font-semibold">
+          {hasApps ? "Choose an application" : "Welcome to AEGIS"}
+        </h2>
         <p className="mt-2 max-w-md text-center text-sm text-ink/55">
-          Register an application to begin. Upload logs, and let AEGIS identify
-          errors, investigate root causes, and suggest fixes.
+          {hasApps
+            ? "Select an application from the header. AEGIS will keep your selection when you refresh."
+            : "Register an application to begin. Upload logs, and let AEGIS identify errors, investigate root causes, and suggest fixes."}
         </p>
+        {hasApps && (
+          <Link to="/applications" className="mt-5 text-sm font-semibold text-oxblood hover:underline">
+            Manage applications →
+          </Link>
+        )}
       </div>
     );
   }
@@ -115,9 +156,13 @@ export default function DashboardPage() {
         <p className="text-xs font-semibold uppercase tracking-widest text-oxblood">
           Overview
         </p>
-        <h2 className="mt-2 text-xl font-semibold">{selected.name}</h2>
+        <h2 className="mt-2 text-xl font-semibold">
+          {allApplicationsSelected ? "All applications" : selected.name}
+        </h2>
         <p className="mt-1 text-sm text-ink/55">
-          {selected.description || "Application diagnostics at a glance."}
+          {allApplicationsSelected
+            ? `Aggregated diagnostics across ${applications.length} applications.`
+            : selected.description || "Application diagnostics at a glance."}
         </p>
       </div>
 
@@ -180,7 +225,11 @@ export default function DashboardPage() {
         ) : (
           <div className="mt-4 space-y-2">
             {incidents.slice(0, 8).map((inc) => (
-              <IncidentRow key={inc.id} incident={inc} />
+              <IncidentRow
+                key={inc.id}
+                incident={inc}
+                applicationName={applications.find((app) => app.id === inc.application_id)?.name}
+              />
             ))}
             {incidents.length > 8 && (
               <Link

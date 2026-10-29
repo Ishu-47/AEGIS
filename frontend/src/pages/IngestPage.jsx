@@ -4,7 +4,7 @@ import { submitLogs } from "../api/aegis";
 import { Upload, FileText, AlertCircle, CheckCircle2 } from "lucide-react";
 
 export default function IngestPage() {
-  const { selected } = useApp();
+  const { selected, allApplicationsSelected } = useApp();
   const [mode, setMode] = useState("paste");
   const [content, setContent] = useState("");
   const [file, setFile] = useState(null);
@@ -42,7 +42,6 @@ export default function IngestPage() {
     try {
       const data = await submitLogs({
         applicationId: selected.id,
-        apiKey: selected.api_key,
         content: mode === "paste" ? content : "",
         file: mode === "upload" ? file : null,
       });
@@ -104,7 +103,9 @@ export default function IngestPage() {
             <div>
               <p className="text-sm font-medium">Source application</p>
               <p className="mt-1 text-sm text-ink/55">
-                {selected?.name || "Select an application in the header."}
+                {selected?.name || (allApplicationsSelected
+                  ? "Choose a specific application in the header to ingest logs."
+                  : "Select an application in the header.")}
               </p>
             </div>
 

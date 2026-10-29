@@ -7,6 +7,7 @@ export default function RegisterModal({ onClose }) {
   const { addApplication } = useApp();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const [platform, setPlatform] = useState("Python");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [created, setCreated] = useState(null);
@@ -18,7 +19,7 @@ export default function RegisterModal({ onClose }) {
     setLoading(true);
 
     try {
-      const result = await registerApplication({ name, description });
+      const result = await registerApplication({ name, description, platform });
       addApplication(result);
       setCreated(result);
     } catch (err) {
@@ -69,6 +70,22 @@ export default function RegisterModal({ onClose }) {
                 className="mt-2 w-full rounded-lg border border-ink/15 bg-white/50 px-3 py-2.5 text-sm outline-none transition focus:border-oxblood"
               />
             </div>
+            <div>
+              <label htmlFor="reg-platform" className="block text-sm font-medium">
+                Platform
+              </label>
+              <select
+                id="reg-platform"
+                value={platform}
+                onChange={(e) => setPlatform(e.target.value)}
+                className="mt-2 w-full rounded-lg border border-ink/15 bg-white/50 px-3 py-2.5 text-sm outline-none transition focus:border-oxblood"
+              >
+                {["Python", "Java", "Node.js", "JavaScript", "Go", "Ruby", "PHP", ".NET", "Rust", "Other"].map((item) => (
+                  <option key={item} value={item}>{item}</option>
+                ))}
+              </select>
+            </div>
+
             <div>
               <label htmlFor="reg-desc" className="block text-sm font-medium">
                 Description{" "}
