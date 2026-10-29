@@ -42,12 +42,16 @@ class Application(Base):
         index=True,
         nullable=False,
     )
+    owner_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
 
+    owner: Mapped["User | None"] = relationship()
     incidents: Mapped[list["Incident"]] = relationship(
         back_populates="application",
         cascade="all, delete-orphan",
@@ -182,7 +186,7 @@ class InvestigationReport(Base):
 
 
 class User(Base):
-    """Single dashboard owner account for the current single-tenant MVP."""
+    """Dashboard account; each account sees only its own applications."""
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

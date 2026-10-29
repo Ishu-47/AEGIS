@@ -59,7 +59,7 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Dashboard authentication (single-owner MVP)
+# Dashboard authentication
 # ---------------------------------------------------------------------------
 
 SESSION_COOKIE = "aegis_session"
@@ -176,6 +176,19 @@ def require_dashboard_user(
         if not valid_pair:
             raise HTTPException(status_code=403, detail="CSRF validation failed. Refresh the page and try again.")
     return user
+
+
+def get_owned_application(db: Session, application_id: str, user: User) -> Application:
+    application = db.scalar(
+        select(Application).where(
+            Application.id == application_id,
+            Application.owner_user_id == user.id,
+        )
+    )
+    if application is None:
+        # Do not disclose whether another user's application exists.
+        raise HTTPException(status_code=404, detail="Application not found.")
+    return application
 
 
 # ---------------------------------------------------------------------------
@@ -526,10 +539,9 @@ def auth_status(
     db: Session = Depends(get_db),
 ):
     user = get_optional_dashboard_user(request, db)
-    has_user = db.scalar(select(func.count(User.id))) or 0
     return {
         "authenticated": user is not None,
-        "registration_available": has_user == 0,
+        "registration_available": True,
         "email": user.email if user else None,
     }
 
@@ -540,12 +552,6 @@ def register_dashboard_user(
     response: Response,
     db: Session = Depends(get_db),
 ):
-    existing = db.scalar(select(func.count(User.id))) or 0
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail="The dashboard owner account already exists. Please log in.",
-        )
     email = payload.email.strip().lower()
     if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
         raise HTTPException(status_code=422, detail="Enter a valid email address.")
@@ -559,6 +565,12 @@ def register_dashboard_user(
         db.rollback()
         raise HTTPException(status_code=409, detail="An account already exists. Please log in.")
 
+    # Legacy applications without an owner are claimed by the first account
+    # created after ownership support is installed. Later accounts cannot see them.
+    unowned = db.scalars(select(Application).where(Application.owner_user_id.is_(None))).all()
+    for application in unowned:
+        application.owner_user_id = user.id
+    db.commit()
     _set_session_cookies(response, user, db)
     return {"authenticated": True, "email": user.email}
 
@@ -631,6 +643,7 @@ def register_application(
         description=payload.description.strip(),
         platform=payload.platform.strip() or "Other",
         api_key_hash=hash_api_key(api_key),
+        owner_user_id=current_user.id,
     )
 
     db.add(application)
@@ -654,7 +667,7 @@ def list_applications(
     db: Session = Depends(get_db),
 ):
     applications = db.scalars(
-        select(Application).order_by(Application.created_at.desc())
+        select(Application).where(Application.owner_user_id == current_user.id).order_by(Application.created_at.desc())
     ).all()
 
     return [
@@ -675,9 +688,7 @@ def delete_application(
     current_user: User = Depends(require_dashboard_user),
     db: Session = Depends(get_db),
 ):
-    application = db.get(Application, application_id)
-    if application is None:
-        raise HTTPException(status_code=404, detail="Application not found.")
+    application = get_owned_application(db, application_id, current_user)
     db.delete(application)
     db.commit()
     return {"deleted": True, "application_id": application_id}
@@ -689,9 +700,7 @@ def rotate_application_key(
     current_user: User = Depends(require_dashboard_user),
     db: Session = Depends(get_db),
 ):
-    application = db.get(Application, application_id)
-    if application is None:
-        raise HTTPException(status_code=404, detail="Application not found.")
+    application = get_owned_application(db, application_id, current_user)
 
     api_key = secrets.token_urlsafe(32)
     application.api_key_hash = hash_api_key(api_key)
@@ -763,8 +772,7 @@ async def dashboard_upload_logs(
     current_user: User = Depends(require_dashboard_user),
     db: Session = Depends(get_db),
 ):
-    if db.get(Application, application_id) is None:
-        raise HTTPException(status_code=404, detail="Application not found.")
+    get_owned_application(db, application_id, current_user)
     return await _process_log_upload(application_id, content, file, db)
 
 
@@ -839,8 +847,7 @@ def list_incidents(
     current_user: User = Depends(require_dashboard_user),
     db: Session = Depends(get_db),
 ):
-    if db.get(Application, application_id) is None:
-        raise HTTPException(status_code=404, detail="Application not found.")
+    get_owned_application(db, application_id, current_user)
 
     incidents = db.scalars(
         select(Incident)
@@ -863,6 +870,7 @@ def get_incident(
 
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found.")
+    get_owned_application(db, incident.application_id, current_user)
 
     # Dashboard authentication is independent from ingestion API keys.
 
@@ -898,6 +906,7 @@ def trigger_investigation(
 
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found.")
+    get_owned_application(db, incident.application_id, current_user)
 
     report = investigate_incident(db, incident)
 
@@ -926,6 +935,7 @@ def update_incident_status(
 
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found.")
+    get_owned_application(db, incident.application_id, current_user)
 
     incident.status = status
     db.commit()
@@ -1039,8 +1049,7 @@ def get_application_stats(
     current_user: User = Depends(require_dashboard_user),
     db: Session = Depends(get_db),
 ):
-    if db.get(Application, application_id) is None:
-        raise HTTPException(status_code=404, detail="Application not found.")
+    get_owned_application(db, application_id, current_user)
 
     total_events = db.scalar(
         select(func.count(LogEvent.id))
