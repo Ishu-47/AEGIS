@@ -584,10 +584,21 @@ def validate_investigation_result(result: dict[str, Any], evidence: dict[str, An
         result["confidence"] = 0.0
     # A report cannot cite a different service as the affected service without flagging it.
     services = set(evidence.get("services", []))
-    if services and result["affected_service"] not in services:
-        result["uncertainty_notes"] = (str(result.get("uncertainty_notes") or "") +
-            " The model named a service not present in the incident evidence; verify this claim.").strip()
+    affected = result["affected_service"].strip()
+    service_matches = any(
+        affected == service or affected.startswith(service + ".") or service.startswith(affected + ".")
+        for service in services
+    )
+    warning = "The model named a service not present in the incident evidence; verify this claim."
+    if services and not service_matches:
+        notes = str(result.get("uncertainty_notes") or "").strip()
+        if warning not in notes:
+            result["uncertainty_notes"] = (notes + " " + warning).strip()
         result["confidence"] = min(result["confidence"], 0.4)
+    else:
+        # Remove a stale warning if a later validation pass confirms the service.
+        notes = str(result.get("uncertainty_notes") or "")
+        result["uncertainty_notes"] = notes.replace(warning, "").strip()
     # Never let generated remediation silently become executable commands.
     result["remediation_steps"] = [step for step in result["remediation_steps"] if len(step) <= 1000]
     result.setdefault("uncertainty_notes", "")

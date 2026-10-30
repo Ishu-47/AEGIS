@@ -239,7 +239,7 @@ def parse_timestamp(value: Any) -> datetime:
     elif isinstance(value, str):
         try:
             result = datetime.fromisoformat(
-                value.strip().replace("Z", "+00:00")
+                value.strip().replace("Z", "+00:00").replace(",", ".")
             )
         except ValueError:
             result = datetime.now(timezone.utc)
@@ -352,10 +352,16 @@ def parse_logs(content: str) -> list[dict[str, Any]]:
             return json_events
 
     # Otherwise, parse plain-text logs one line at a time.
+    # Accept both ISO-8601 timestamps and common plain-text timestamps
+    # such as "2026-10-30 10:00:03 ERROR service - message".
     pattern = re.compile(
-        r"^\s*(?P<timestamp>\S+)\s+"
+        r"^\s*(?P<timestamp>"
+        r"(?:\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)"
+        r"|(?:\d{4}-\d{2}-\d{2}T[^\s]+)"
+        r"|(?:\S+)"
+        r")\s+"
         r"(?P<severity>DEBUG|INFO|WARN|WARNING|ERROR|CRITICAL|FATAL)"
-        r"\s+(?P<service>[\w.$-]+)\s*[-:]\s*"
+        r"\s+(?P<service>[\w.$:/-]+)\s*[-:]\s*"
         r"(?P<message>.*)$",
         re.IGNORECASE,
     )
