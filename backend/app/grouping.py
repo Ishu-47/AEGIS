@@ -253,6 +253,46 @@ def group_events(
 
             touched[incident.id] = incident
 
+        # Attach contextual INFO/DEBUG events only when they carry the same
+        # explicit request/trace/order correlation ID as a detected incident.
+        # This preserves the causal timeline without merging unrelated noise.
+        contextual = [
+            event for event in records
+            if event.application_id == application_id
+            and event.severity.upper() not in INCIDENT_SEVERITIES
+            and event.correlation_id
+        ]
+        for event in contextual:
+            event_time = _as_utc(event.timestamp)
+            fingerprint = _compute_fingerprint(
+                application_id=application_id,
+                service=event.service,
+                signature=_extract_error_signature(event.message),
+                correlation_id=event.correlation_id,
+            )
+            incident = db.scalar(
+                select(Incident)
+                .where(
+                    Incident.application_id == application_id,
+                    Incident.fingerprint == fingerprint,
+                    Incident.first_seen <= event_time + GROUPING_WINDOW,
+                    Incident.last_seen >= event_time - GROUPING_WINDOW,
+                )
+                .order_by(Incident.last_seen.desc())
+                .limit(1)
+            )
+            if incident is None:
+                continue
+            link = db.get(IncidentEvent, (incident.id, event.id))
+            if link is None:
+                db.add(IncidentEvent(incident_id=incident.id, log_event_id=event.id))
+                incident.event_count += 1
+            if event_time < _as_utc(incident.first_seen):
+                incident.first_seen = event_time
+            if event_time > _as_utc(incident.last_seen):
+                incident.last_seen = event_time
+            touched[incident.id] = incident
+
         db.commit()
 
         for incident in touched.values():

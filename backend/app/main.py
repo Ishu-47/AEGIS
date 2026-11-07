@@ -1,11 +1,9 @@
-import base64
-import binascii
 import hashlib
-import hmac
 import os
 import json
 import re
 import secrets
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -16,23 +14,26 @@ from fastapi import (
     Form,
     Header,
     HTTPException,
+    UploadFile,
     Request,
     Response,
-    UploadFile,
+    Cookie,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
+from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import Base, engine, get_db
 from app.models import (
     Application,
     LogEvent,
     Incident,
     IncidentEvent,
     InvestigationReport,
+    KnowledgeDocument,
+    EvaluationCase,
     User,
     UserSession,
 )
@@ -40,155 +41,26 @@ from app.grouping import group_events
 from app.investigation import investigate_incident
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Importing app.models registers the tables with Base.
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
 app = FastAPI(
     title="AEGIS API",
     version="0.5.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        origin.strip()
-        for origin in os.getenv("AEGIS_FRONTEND_ORIGINS", "http://localhost:5173").split(",")
-        if origin.strip()
-    ],
+    allow_origins=[item.strip() for item in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if item.strip()],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["Content-Type", "X-API-Key", "X-CSRF-Token"],
+    allow_headers=["*"],
 )
-
-
-# ---------------------------------------------------------------------------
-# Dashboard authentication
-# ---------------------------------------------------------------------------
-
-SESSION_COOKIE = "aegis_session"
-CSRF_COOKIE = "aegis_csrf"
-SESSION_MAX_AGE = 60 * 60 * 24 * 7
-COOKIE_SECURE = os.getenv("AEGIS_COOKIE_SECURE", "false").lower() == "true"
-
-
-def _b64encode(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
-
-
-def _b64decode(value: str) -> bytes:
-    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-
-
-def _password_hash(password: str, salt: bytes | None = None) -> str:
-    salt = salt or secrets.token_bytes(16)
-    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
-    return f"{_b64encode(salt)}${_b64encode(derived)}"
-
-
-def _verify_password(password: str, encoded: str) -> bool:
-    try:
-        salt_part, hash_part = encoded.split("$", 1)
-        salt = _b64decode(salt_part)
-        expected = _b64decode(hash_part)
-        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
-        return hmac.compare_digest(actual, expected)
-    except (ValueError, TypeError, binascii.Error):
-        return False
-
-
-def _set_session_cookies(response: Response, user: User, db: Session) -> None:
-    token = secrets.token_urlsafe(48)
-    csrf_token = secrets.token_urlsafe(32)
-    now = datetime.now(timezone.utc)
-    db.add(UserSession(
-        user_id=user.id,
-        token_hash=hash_api_key(token),
-        csrf_token_hash=hash_api_key(csrf_token),
-        expires_at=now + timedelta(seconds=SESSION_MAX_AGE),
-    ))
-    db.commit()
-    response.set_cookie(
-        SESSION_COOKIE,
-        token,
-        max_age=SESSION_MAX_AGE,
-        httponly=True,
-        secure=COOKIE_SECURE,
-        samesite="lax",
-        path="/",
-    )
-    response.set_cookie(
-        CSRF_COOKIE,
-        csrf_token,
-        max_age=SESSION_MAX_AGE,
-        httponly=False,
-        secure=COOKIE_SECURE,
-        samesite="lax",
-        path="/",
-    )
-
-
-def _clear_session_cookies(response: Response) -> None:
-    response.delete_cookie(SESSION_COOKIE, path="/", secure=COOKIE_SECURE, httponly=True, samesite="lax")
-    response.delete_cookie(CSRF_COOKIE, path="/", secure=COOKIE_SECURE, httponly=False, samesite="lax")
-
-
-def get_optional_dashboard_user(
-    request: Request,
-    db: Session = Depends(get_db),
-) -> User | None:
-    token = request.cookies.get(SESSION_COOKIE)
-    if not token:
-        return None
-    session = db.scalar(
-        select(UserSession).where(UserSession.token_hash == hash_api_key(token))
-    )
-    if session is None:
-        return None
-    expires_at = session.expires_at
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if expires_at <= datetime.now(timezone.utc):
-        db.delete(session)
-        db.commit()
-        return None
-    return db.get(User, session.user_id)
-
-
-def require_dashboard_user(
-    request: Request,
-    db: Session = Depends(get_db),
-) -> User:
-    user = get_optional_dashboard_user(request, db)
-    if user is None:
-        raise HTTPException(status_code=401, detail="Please log in to access the AEGIS dashboard.")
-
-    if request.method.upper() not in {"GET", "HEAD", "OPTIONS"}:
-        session_token = request.cookies.get(SESSION_COOKIE, "")
-        session = db.scalar(
-            select(UserSession).where(UserSession.token_hash == hash_api_key(session_token))
-        )
-        cookie_token = request.cookies.get(CSRF_COOKIE, "")
-        header_token = request.headers.get("X-CSRF-Token", "")
-        valid_pair = (
-            session is not None
-            and bool(cookie_token)
-            and bool(header_token)
-            and hmac.compare_digest(cookie_token, header_token)
-            and hmac.compare_digest(hash_api_key(cookie_token), session.csrf_token_hash)
-        )
-        if not valid_pair:
-            raise HTTPException(status_code=403, detail="CSRF validation failed. Refresh the page and try again.")
-    return user
-
-
-def get_owned_application(db: Session, application_id: str, user: User) -> Application:
-    application = db.scalar(
-        select(Application).where(
-            Application.id == application_id,
-            Application.owner_user_id == user.id,
-        )
-    )
-    if application is None:
-        # Do not disclose whether another user's application exists.
-        raise HTTPException(status_code=404, detail="Application not found.")
-    return application
 
 
 # ---------------------------------------------------------------------------
@@ -196,18 +68,13 @@ def get_owned_application(db: Session, application_id: str, user: User) -> Appli
 # ---------------------------------------------------------------------------
 
 class ApplicationCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=150)
-    description: str = Field(default="", max_length=2000)
-    platform: str = Field(default="Other", min_length=1, max_length=50)
+    name: str = Field(min_length=2, max_length=150)
+    description: str = Field(default="", max_length=500)
+    platform: str = Field(default="Other", max_length=50)
 
 
-class AuthRegister(BaseModel):
-    email: str = Field(min_length=5, max_length=320)
-    password: str = Field(min_length=10, max_length=128)
-
-
-class AuthLogin(BaseModel):
-    email: str = Field(min_length=5, max_length=320)
+class DashboardAuthPayload(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=1, max_length=128)
 
 
@@ -225,6 +92,39 @@ class IngestRequest(BaseModel):
     events: list[LogEventInput] = Field(max_length=500)
 
 
+class KnowledgeDocCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    content: str = Field(min_length=1)
+    doc_type: str = Field(
+        pattern=r"^(runbook|postmortem|architecture|sop)$",
+    )
+    tags: list[str] = Field(default_factory=list)
+
+
+class KnowledgeIndexRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    content: str = Field(min_length=1)
+    source_type: str = Field(default="runbook", max_length=50)
+    source_uri: str | None = Field(default=None, max_length=2000)
+    replace_existing: bool = False
+
+
+class KnowledgeDocUpdate(BaseModel):
+    title: str | None = None
+    content: str | None = None
+    doc_type: str | None = None
+    tags: list[str] | None = None
+
+
+class EvalCaseCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    description: str = ""
+    events_json: list[dict]
+    expected_root_cause: str
+    expected_services: list[str]
+    expected_severity: str
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -239,7 +139,7 @@ def parse_timestamp(value: Any) -> datetime:
     elif isinstance(value, str):
         try:
             result = datetime.fromisoformat(
-                value.strip().replace("Z", "+00:00").replace(",", ".")
+                value.strip().replace("Z", "+00:00")
             )
         except ValueError:
             result = datetime.now(timezone.utc)
@@ -293,7 +193,22 @@ def normalize_event(
         or raw.get("traceId")
         or raw.get("request_id")
         or raw.get("requestId")
+        or raw.get("order_id")
+        or raw.get("orderId")
+        or raw.get("transaction_id")
+        or raw.get("transactionId")
     )
+    if not correlation_id:
+        # Plain-text logs commonly carry request/order/trace identifiers in
+        # their message rather than in a structured field. Extract only
+        # explicitly named identifiers; never guess from arbitrary numbers.
+        identifier_match = re.search(
+            r"\b(?:trace|request|correlation|order|transaction|session)_?id\s*[=: ]\s*[\'\"]?([A-Za-z0-9._:-]+)",
+            message,
+            re.IGNORECASE,
+        )
+        if identifier_match:
+            correlation_id = identifier_match.group(1)
 
     return {
         "timestamp": parse_timestamp(timestamp),
@@ -352,17 +267,11 @@ def parse_logs(content: str) -> list[dict[str, Any]]:
             return json_events
 
     # Otherwise, parse plain-text logs one line at a time.
-    # Accept both ISO-8601 timestamps and common plain-text timestamps
-    # such as "2026-10-30 10:00:03 ERROR service - message".
     pattern = re.compile(
-        r"^\s*(?P<timestamp>"
-        r"(?:\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)"
-        r"|(?:\d{4}-\d{2}-\d{2}T[^\s]+)"
-        r"|(?:\S+)"
-        r")\s+"
-        r"(?P<severity>DEBUG|INFO|WARN|WARNING|ERROR|CRITICAL|FATAL)"
-        r"\s+(?P<service>[\w.$:/-]+)\s*[-:]\s*"
-        r"(?P<message>.*)$",
+        r"^\s*(?P<timestamp>(?:\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?|\S+))\s+"
+        r"(?P<severity>DEBUG|INFO|WARN|WARNING|ERROR|CRITICAL|FATAL)\s+"
+        r"(?:\[(?P<bracket_service>[\w.$-]+)\]|(?P<service>[\w.$-]+))"
+        r"\s+(?:[-:]\s*)?(?P<message>.*)$",
         re.IGNORECASE,
     )
 
@@ -383,6 +292,12 @@ def parse_logs(content: str) -> list[dict[str, Any]]:
                 events.append(normalize_event(current_multiline))
 
             current_multiline = match.groupdict()
+            current_multiline["service"] = (
+                current_multiline.get("bracket_service")
+                or current_multiline.get("service")
+                or "unknown"
+            )
+            current_multiline.pop("bracket_service", None)
         elif current_multiline:
             # Append to current multiline (stack trace continuation)
             current_multiline["message"] += "\n" + line_stripped
@@ -491,6 +406,10 @@ def save_events(
         raise
 
 
+# ---------------------------------------------------------------------------
+# Serializers
+# ---------------------------------------------------------------------------
+
 def serialize_event(event: LogEvent) -> dict[str, Any]:
     return {
         "id": event.id,
@@ -523,104 +442,208 @@ def serialize_report(report: InvestigationReport) -> dict[str, Any]:
     return {
         "id": report.id,
         "incident_id": report.incident_id,
+        # 11-section report
+        "incident_summary": report.incident_summary,
         "observed_error": report.observed_error,
         "affected_service": report.affected_service,
+        "downstream_services": report.downstream_services,
+        "timeline_summary": report.timeline_summary,
         "probable_root_cause": report.probable_root_cause,
+        "alternative_hypotheses": report.alternative_hypotheses,
         "supporting_evidence": report.supporting_evidence,
-        "remediation_steps": report.remediation_steps,
+        "evidence_mapping": report.evidence_mapping,
         "stack_trace_locations": report.stack_trace_locations,
         "confidence": report.confidence,
+        "confidence_factors": report.confidence_factors,
+        "historical_context_summary": (
+            ((report.raw_llm_response or {}).get("report") or {}).get("historical_context_summary", [])
+            if isinstance((report.raw_llm_response or {}).get("report") if isinstance(report.raw_llm_response, dict) else None, dict)
+            else []
+        ),
         "uncertainty_notes": report.uncertainty_notes,
+        "remediation_steps": report.remediation_steps,
+        "verification_steps": report.verification_steps,
+        # Metadata
+        "investigation_steps": report.investigation_steps,
+        "events_analyzed": report.events_analyzed,
+        "events_cited": report.events_cited,
+        "model_used": report.model_used,
         "created_at": report.created_at,
     }
 
 
-# ---------------------------------------------------------------------------
-# Routes — Dashboard authentication
-# ---------------------------------------------------------------------------
-
-@app.get("/api/auth/status")
-def auth_status(
-    request: Request,
-    db: Session = Depends(get_db),
-):
-    user = get_optional_dashboard_user(request, db)
+def serialize_knowledge_doc(doc: KnowledgeDocument) -> dict[str, Any]:
     return {
-        "authenticated": user is not None,
-        "registration_available": True,
-        "email": user.email if user else None,
+        "id": doc.id,
+        "application_id": doc.application_id,
+        "title": doc.title,
+        "content": doc.content,
+        "doc_type": doc.doc_type,
+        "tags": doc.tags,
+        "created_at": doc.created_at,
+        "updated_at": doc.updated_at,
     }
 
 
-@app.post("/api/auth/register")
-def register_dashboard_user(
-    payload: AuthRegister,
-    response: Response,
+def serialize_eval_case(case: EvaluationCase) -> dict[str, Any]:
+    return {
+        "id": case.id,
+        "name": case.name,
+        "description": case.description,
+        "events_json": case.events_json,
+        "expected_root_cause": case.expected_root_cause,
+        "expected_services": case.expected_services,
+        "expected_severity": case.expected_severity,
+        "last_score": case.last_score,
+        "last_result": case.last_result,
+        "last_run_at": case.last_run_at,
+        "created_at": case.created_at,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard authentication (opaque server-side sessions + CSRF protection)
+# ---------------------------------------------------------------------------
+
+SESSION_COOKIE = "aegis_session"
+CSRF_COOKIE = "aegis_csrf"
+SESSION_TTL = timedelta(days=14)
+
+
+def _hash_secret(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _password_hash(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
+    return "pbkdf2_sha256$310000$" + salt.hex() + "$" + derived.hex()
+
+
+def _verify_password(password: str, encoded: str) -> bool:
+    try:
+        scheme, rounds, salt_hex, digest = encoded.split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(rounds)).hex()
+        return secrets.compare_digest(actual, digest)
+    except (ValueError, TypeError):
+        return False
+
+
+def current_dashboard_user(
+    request: Request,
     db: Session = Depends(get_db),
-):
+    session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+) -> User:
+    if not session_cookie:
+        raise HTTPException(status_code=401, detail="Please sign in.")
+    session = db.scalar(select(UserSession).where(UserSession.token_hash == _hash_secret(session_cookie)))
+    now = datetime.now(timezone.utc)
+    if session is None:
+        raise HTTPException(status_code=401, detail="Session expired. Please sign in again.")
+    expires = session.expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if expires <= now:
+        db.delete(session)
+        db.commit()
+        raise HTTPException(status_code=401, detail="Session expired. Please sign in again.")
+    user = db.get(User, session.user_id)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Account no longer exists.")
+    request.state.aegis_session = session
+    return user
+
+
+def require_csrf(request: Request, user: User = Depends(current_dashboard_user), db: Session = Depends(get_db)) -> User:
+    session = getattr(request.state, "aegis_session", None)
+    cookie_token = request.cookies.get(CSRF_COOKIE)
+    header_token = request.headers.get("X-CSRF-Token")
+    if not session or not cookie_token or not header_token:
+        raise HTTPException(status_code=403, detail="CSRF validation failed. Refresh and try again.")
+    if not secrets.compare_digest(cookie_token, header_token) or not secrets.compare_digest(_hash_secret(cookie_token), session.csrf_token_hash):
+        raise HTTPException(status_code=403, detail="CSRF validation failed. Refresh and try again.")
+    return user
+
+
+def _issue_session(db: Session, user: User, response: Response) -> None:
+    raw_session = secrets.token_urlsafe(48)
+    csrf = secrets.token_urlsafe(32)
+    db.add(UserSession(
+        user_id=user.id,
+        token_hash=_hash_secret(raw_session),
+        csrf_token_hash=_hash_secret(csrf),
+        expires_at=datetime.now(timezone.utc) + SESSION_TTL,
+    ))
+    db.commit()
+    secure = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+    response.set_cookie(SESSION_COOKIE, raw_session, httponly=True, secure=secure, samesite="lax", max_age=int(SESSION_TTL.total_seconds()), path="/")
+    response.set_cookie(CSRF_COOKIE, csrf, httponly=False, secure=secure, samesite="lax", max_age=int(SESSION_TTL.total_seconds()), path="/")
+
+
+@app.get("/api/auth/status")
+def auth_status(db: Session = Depends(get_db), session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)):
+    if session_cookie:
+        session = db.scalar(select(UserSession).where(UserSession.token_hash == _hash_secret(session_cookie)))
+        if session:
+            expires = session.expires_at if session.expires_at.tzinfo else session.expires_at.replace(tzinfo=timezone.utc)
+            account = db.get(User, session.user_id) if expires > datetime.now(timezone.utc) else None
+            if account:
+                return {"authenticated": True, "email": account.email, "registration_available": True}
+    return {"authenticated": False, "email": None, "registration_available": True}
+
+
+@app.post("/api/auth/register")
+def register_dashboard_user(payload: DashboardAuthPayload, response: Response, db: Session = Depends(get_db)):
     email = payload.email.strip().lower()
     if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
         raise HTTPException(status_code=422, detail="Enter a valid email address.")
-
+    if len(payload.password) < 10:
+        raise HTTPException(status_code=422, detail="Password must contain at least 10 characters.")
+    existing = db.scalar(select(User).where(func.lower(User.email) == email))
+    if existing:
+        raise HTTPException(status_code=409, detail="An account with this email already exists. Sign in instead.")
     user = User(email=email, password_hash=_password_hash(payload.password))
     db.add(user)
     try:
         db.commit()
-        db.refresh(user)
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="An account already exists. Please log in.")
-
-    # Legacy applications without an owner are claimed by the first account
-    # created after ownership support is installed. Later accounts cannot see them.
-    unowned = db.scalars(select(Application).where(Application.owner_user_id.is_(None))).all()
-    for application in unowned:
-        application.owner_user_id = user.id
-    db.commit()
-    _set_session_cookies(response, user, db)
+        raise HTTPException(status_code=409, detail="An account with this email already exists. Sign in instead.")
+    db.refresh(user)
+    _issue_session(db, user, response)
     return {"authenticated": True, "email": user.email}
 
 
 @app.post("/api/auth/login")
-def login_dashboard_user(
-    payload: AuthLogin,
-    response: Response,
-    db: Session = Depends(get_db),
-):
+def login_dashboard_user(payload: DashboardAuthPayload, response: Response, db: Session = Depends(get_db)):
     email = payload.email.strip().lower()
-    user = db.scalar(select(User).where(User.email == email))
-    if user is None or not _verify_password(payload.password, user.password_hash):
+    user = db.scalar(select(User).where(func.lower(User.email) == email))
+    if not user or not _verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
-
-    _set_session_cookies(response, user, db)
+    _issue_session(db, user, response)
     return {"authenticated": True, "email": user.email}
 
 
 @app.post("/api/auth/logout")
-def logout_dashboard_user(
-    request: Request,
-    response: Response,
-    db: Session = Depends(get_db),
-):
-    token = request.cookies.get(SESSION_COOKIE)
-    if token:
-        session = db.scalar(
-            select(UserSession).where(UserSession.token_hash == hash_api_key(token))
-        )
-        if session is not None:
-            csrf_cookie = request.cookies.get(CSRF_COOKIE, "")
-            csrf_header = request.headers.get("X-CSRF-Token", "")
-            if (
-                not csrf_cookie
-                or not csrf_header
-                or not hmac.compare_digest(csrf_cookie, csrf_header)
-                or not hmac.compare_digest(hash_api_key(csrf_cookie), session.csrf_token_hash)
-            ):
-                raise HTTPException(status_code=403, detail="CSRF validation failed.")
+def logout_dashboard_user(response: Response, request: Request, db: Session = Depends(get_db)):
+    raw = request.cookies.get(SESSION_COOKIE)
+    if raw:
+        session = db.scalar(select(UserSession).where(UserSession.token_hash == _hash_secret(raw)))
+        if session:
             db.delete(session)
             db.commit()
-    _clear_session_cookies(response)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    response.delete_cookie(CSRF_COOKIE, path="/")
     return {"authenticated": False}
+
+
+def owned_application(db: Session, application_id: str, user: User) -> Application:
+    app_record = db.get(Application, application_id)
+    if app_record is None or app_record.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="Application not found.")
+    return app_record
 
 
 # ---------------------------------------------------------------------------
@@ -639,24 +662,20 @@ def health():
 @app.post("/api/applications")
 def register_application(
     payload: ApplicationCreate,
-    current_user: User = Depends(require_dashboard_user),
+    user: User = Depends(require_csrf),
     db: Session = Depends(get_db),
 ):
     api_key = secrets.token_urlsafe(32)
-
     application = Application(
         name=payload.name.strip(),
         description=payload.description.strip(),
         platform=payload.platform.strip() or "Other",
+        owner_user_id=user.id,
         api_key_hash=hash_api_key(api_key),
-        owner_user_id=current_user.id,
     )
-
     db.add(application)
     db.commit()
     db.refresh(application)
-
-    # Return the secret only at registration time.
     return {
         "id": application.id,
         "name": application.name,
@@ -669,13 +688,13 @@ def register_application(
 
 @app.get("/api/applications")
 def list_applications(
-    current_user: User = Depends(require_dashboard_user),
+    user: User = Depends(current_dashboard_user),
     db: Session = Depends(get_db),
 ):
     applications = db.scalars(
-        select(Application).where(Application.owner_user_id == current_user.id).order_by(Application.created_at.desc())
+        select(Application).where(Application.owner_user_id == user.id)
+        .order_by(Application.created_at.desc())
     ).all()
-
     return [
         {
             "id": item.id,
@@ -689,33 +708,167 @@ def list_applications(
 
 
 @app.delete("/api/applications/{application_id}")
-def delete_application(
-    application_id: str,
-    current_user: User = Depends(require_dashboard_user),
-    db: Session = Depends(get_db),
-):
-    application = get_owned_application(db, application_id, current_user)
-    db.delete(application)
+def delete_application(application_id: str, user: User = Depends(require_csrf), db: Session = Depends(get_db)):
+    item = owned_application(db, application_id, user)
+    db.delete(item)
     db.commit()
-    return {"deleted": True, "application_id": application_id}
+    return {"status": "deleted"}
 
 
 @app.post("/api/applications/{application_id}/rotate-key")
-def rotate_application_key(
+def rotate_application_key(application_id: str, user: User = Depends(require_csrf), db: Session = Depends(get_db)):
+    item = owned_application(db, application_id, user)
+    api_key = secrets.token_urlsafe(32)
+    item.api_key_hash = hash_api_key(api_key)
+    db.commit()
+    return {"id": item.id, "api_key": api_key}
+
+
+# ---------------------------------------------------------------------------
+# Dashboard session-protected API
+# ---------------------------------------------------------------------------
+
+@app.post("/api/dashboard/applications/{application_id}/logs")
+async def dashboard_upload_logs(
     application_id: str,
-    current_user: User = Depends(require_dashboard_user),
+    content: str | None = Form(default=None),
+    file: UploadFile | None = File(default=None),
+    user: User = Depends(require_csrf),
     db: Session = Depends(get_db),
 ):
-    application = get_owned_application(db, application_id, current_user)
-
-    api_key = secrets.token_urlsafe(32)
-    application.api_key_hash = hash_api_key(api_key)
-    db.commit()
+    owned_application(db, application_id, user)
+    if file is not None:
+        filename = (file.filename or "").lower()
+        if not filename.endswith((".log", ".txt", ".json")):
+            raise HTTPException(status_code=400, detail="Upload a .log, .txt, or .json file.")
+        data = await file.read(1_000_001)
+        if len(data) > 1_000_000:
+            raise HTTPException(status_code=413, detail="Maximum upload size is 1 MB.")
+        try:
+            content = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail="The uploaded file must be UTF-8 text.")
+    if not content or not content.strip():
+        raise HTTPException(status_code=400, detail="Paste logs or select a file.")
+    events = parse_logs(content)
+    records = save_events(db, application_id, events)
+    grouped = group_events(db, application_id, records)
     return {
-        "application_id": application.id,
-        "api_key": api_key,
-        "message": "Copy this key now. The previous key has been invalidated and cannot be recovered.",
+        "accepted": len(records),
+        "events": [serialize_event(item) for item in records],
+        "incidents_created": grouped.created_count,
+        "incidents_updated": grouped.updated_count,
+        "incidents_touched": len(grouped.incidents),
     }
+
+
+@app.get("/api/dashboard/applications/{application_id}/incidents")
+def dashboard_list_incidents(application_id: str, user: User = Depends(current_dashboard_user), db: Session = Depends(get_db)):
+    owned_application(db, application_id, user)
+    items = db.scalars(
+        select(Incident)
+        .options(selectinload(Incident.report))
+        .where(Incident.application_id == application_id)
+        .order_by(Incident.last_seen.desc())
+    ).all()
+    return {"incidents": [serialize_incident(item) for item in items]}
+
+
+def dashboard_owned_incident(db: Session, incident_id: int, user: User) -> Incident:
+    incident = db.get(Incident, incident_id)
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found.")
+    owned_application(db, incident.application_id, user)
+    return incident
+
+
+@app.get("/api/dashboard/incidents/{incident_id}")
+def dashboard_get_incident(incident_id: int, user: User = Depends(current_dashboard_user), db: Session = Depends(get_db)):
+    incident = db.scalars(
+        select(Incident)
+        .options(selectinload(Incident.report))
+        .where(Incident.id == incident_id)
+    ).first()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found.")
+    owned_application(db, incident.application_id, user)
+    event_ids = db.scalars(
+        select(IncidentEvent.log_event_id).where(IncidentEvent.incident_id == incident_id)
+    ).all()
+    events = (
+        db.scalars(
+            select(LogEvent)
+            .where(
+                LogEvent.application_id == incident.application_id,
+                LogEvent.id.in_(event_ids),
+            )
+            .order_by(LogEvent.timestamp.asc(), LogEvent.id.asc())
+        ).all()
+        if event_ids else []
+    )
+
+    # Older AEGIS records may have an incident row/event_count but no junction
+    # rows (e.g. incidents created before incident_events was populated).
+    # Recover a bounded, application-scoped timeline instead of rendering an
+    # apparently empty incident. The buffer captures nearby causal context.
+    events_recovered = False
+    if not events:
+        from datetime import timedelta
+        first_seen = incident.first_seen
+        last_seen = incident.last_seen
+        if first_seen.tzinfo is None:
+            first_seen = first_seen.replace(tzinfo=timezone.utc)
+        if last_seen.tzinfo is None:
+            last_seen = last_seen.replace(tzinfo=timezone.utc)
+        events = db.scalars(
+            select(LogEvent)
+            .where(
+                LogEvent.application_id == incident.application_id,
+                LogEvent.timestamp >= first_seen - timedelta(minutes=5),
+                LogEvent.timestamp <= last_seen + timedelta(minutes=5),
+            )
+            .order_by(LogEvent.timestamp.asc(), LogEvent.id.asc())
+            .limit(500)
+        ).all()
+        events_recovered = bool(events)
+
+    result = serialize_incident(incident)
+    result["events"] = [serialize_event(event) for event in events]
+    result["events_recovered"] = events_recovered
+    result["event_count"] = max(incident.event_count or 0, len(events)) if events_recovered else incident.event_count
+    if incident.report:
+        result["report"] = serialize_report(incident.report)
+    return result
+
+
+@app.post("/api/dashboard/incidents/{incident_id}/investigate")
+def dashboard_investigate(incident_id: int, user: User = Depends(require_csrf), db: Session = Depends(get_db)):
+    incident = dashboard_owned_incident(db, incident_id, user)
+    report = investigate_incident(db, incident)
+    return {"status": "completed", "report": serialize_report(report)}
+
+
+@app.patch("/api/dashboard/incidents/{incident_id}/status")
+def dashboard_update_status(incident_id: int, status: str, user: User = Depends(require_csrf), db: Session = Depends(get_db)):
+    valid = {"open", "investigating", "investigated", "resolved", "dismissed"}
+    if status not in valid:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Use one of: {', '.join(sorted(valid))}")
+    incident = dashboard_owned_incident(db, incident_id, user)
+    incident.status = status
+    db.commit()
+    return serialize_incident(incident)
+
+
+@app.get("/api/dashboard/applications/{application_id}/stats")
+def dashboard_stats(application_id: str, user: User = Depends(current_dashboard_user), db: Session = Depends(get_db)):
+    owned_application(db, application_id, user)
+    total_events = db.scalar(select(func.count(LogEvent.id)).where(LogEvent.application_id == application_id)) or 0
+    total_incidents = db.scalar(select(func.count(Incident.id)).where(Incident.application_id == application_id)) or 0
+    open_incidents = db.scalar(select(func.count(Incident.id)).where(Incident.application_id == application_id, Incident.status == "open")) or 0
+    investigated = db.scalar(select(func.count(Incident.id)).where(Incident.application_id == application_id, Incident.status == "investigated")) or 0
+    resolved = db.scalar(select(func.count(Incident.id)).where(Incident.application_id == application_id, Incident.status == "resolved")) or 0
+    knowledge_docs = db.scalar(select(func.count(KnowledgeDocument.id)).where(KnowledgeDocument.application_id == application_id)) or 0
+    return {"total_events": total_events, "total_incidents": total_incidents, "open_incidents": open_incidents, "investigated_incidents": investigated, "resolved_incidents": resolved, "knowledge_documents": knowledge_docs}
 
 
 # ---------------------------------------------------------------------------
@@ -730,37 +883,49 @@ async def upload_logs(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     db: Session = Depends(get_db),
 ):
-    # Backward-compatible API-key endpoint for integrations.
     get_authorized_application(db, application_id, x_api_key)
-    return await _process_log_upload(application_id, content, file, db)
 
-
-async def _process_log_upload(
-    application_id: str,
-    content: str | None,
-    file: UploadFile | None,
-    db: Session,
-):
     if file is not None:
         filename = (file.filename or "").lower()
+
         if not filename.endswith((".log", ".txt", ".json")):
-            raise HTTPException(status_code=400, detail="Upload a .log, .txt, or .json file.")
+            raise HTTPException(
+                status_code=400,
+                detail="Upload a .log, .txt, or .json file.",
+            )
 
         data = await file.read(1_000_001)
+
         if len(data) > 1_000_000:
-            raise HTTPException(status_code=413, detail="Maximum upload size is 1 MB.")
+            raise HTTPException(
+                status_code=413,
+                detail="Maximum upload size is 1 MB.",
+            )
 
         try:
             content = data.decode("utf-8-sig")
         except UnicodeDecodeError:
-            raise HTTPException(status_code=400, detail="The uploaded file must be UTF-8 text.")
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file must be UTF-8 text.",
+            )
 
     if not content or not content.strip():
-        raise HTTPException(status_code=400, detail="Paste logs or select a file.")
+        raise HTTPException(
+            status_code=400,
+            detail="Paste logs or select a file.",
+        )
 
+    
     events = parse_logs(content)
     records = save_events(db, application_id, events)
-    grouping_result = group_events(db, application_id, records)
+
+    grouping_result = group_events(
+        db,
+        application_id,
+        records,
+    )
+
     return {
         "accepted": len(records),
         "events": [serialize_event(item) for item in records],
@@ -769,17 +934,6 @@ async def _process_log_upload(
         "incidents_touched": len(grouping_result.incidents),
     }
 
-
-@app.post("/api/dashboard/applications/{application_id}/logs")
-async def dashboard_upload_logs(
-    application_id: str,
-    content: str | None = Form(default=None),
-    file: UploadFile | None = File(default=None),
-    current_user: User = Depends(require_dashboard_user),
-    db: Session = Depends(get_db),
-):
-    get_owned_application(db, application_id, current_user)
-    return await _process_log_upload(application_id, content, file, db)
 
 
 # ---------------------------------------------------------------------------
@@ -847,13 +1001,13 @@ def get_application_logs(
 # Routes — Incidents
 # ---------------------------------------------------------------------------
 
-@app.get("/api/dashboard/applications/{application_id}/incidents")
+@app.get("/api/applications/{application_id}/incidents")
 def list_incidents(
     application_id: str,
-    current_user: User = Depends(require_dashboard_user),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     db: Session = Depends(get_db),
 ):
-    get_owned_application(db, application_id, current_user)
+    get_authorized_application(db, application_id, x_api_key)
 
     incidents = db.scalars(
         select(Incident)
@@ -866,19 +1020,18 @@ def list_incidents(
     }
 
 
-@app.get("/api/dashboard/incidents/{incident_id}")
+@app.get("/api/incidents/{incident_id}")
 def get_incident(
     incident_id: int,
-    current_user: User = Depends(require_dashboard_user),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     db: Session = Depends(get_db),
 ):
     incident = db.get(Incident, incident_id)
 
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found.")
-    get_owned_application(db, incident.application_id, current_user)
 
-    # Dashboard authentication is independent from ingestion API keys.
+    get_authorized_application(db, incident.application_id, x_api_key)
 
     # Get linked events
     event_ids = db.scalars(
@@ -902,17 +1055,18 @@ def get_incident(
     return result
 
 
-@app.post("/api/dashboard/incidents/{incident_id}/investigate")
+@app.post("/api/incidents/{incident_id}/investigate")
 def trigger_investigation(
     incident_id: int,
-    current_user: User = Depends(require_dashboard_user),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     db: Session = Depends(get_db),
 ):
     incident = db.get(Incident, incident_id)
 
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found.")
-    get_owned_application(db, incident.application_id, current_user)
+
+    get_authorized_application(db, incident.application_id, x_api_key)
 
     report = investigate_incident(db, incident)
 
@@ -922,11 +1076,11 @@ def trigger_investigation(
     }
 
 
-@app.patch("/api/dashboard/incidents/{incident_id}/status")
+@app.patch("/api/incidents/{incident_id}/status")
 def update_incident_status(
     incident_id: int,
     status: str,
-    current_user: User = Depends(require_dashboard_user),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     db: Session = Depends(get_db),
 ):
     valid_statuses = {"open", "investigating", "investigated", "resolved", "dismissed"}
@@ -941,121 +1095,26 @@ def update_incident_status(
 
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found.")
-    get_owned_application(db, incident.application_id, current_user)
+
+    get_authorized_application(db, incident.application_id, x_api_key)
 
     incident.status = status
     db.commit()
 
     return serialize_incident(incident)
-
-
-# ---------------------------------------------------------------------------
-# Backward-compatible API-key endpoints for existing integrations
-# ---------------------------------------------------------------------------
-
-@app.get("/api/applications/{application_id}/incidents")
-def legacy_list_incidents(
-    application_id: str,
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    db: Session = Depends(get_db),
-):
-    get_authorized_application(db, application_id, x_api_key)
-    incidents = db.scalars(
-        select(Incident)
-        .where(Incident.application_id == application_id)
-        .order_by(Incident.last_seen.desc())
-    ).all()
-    return {"incidents": [serialize_incident(inc) for inc in incidents]}
-
-
-@app.get("/api/incidents/{incident_id}")
-def legacy_get_incident(
-    incident_id: int,
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    db: Session = Depends(get_db),
-):
-    incident = db.get(Incident, incident_id)
-    if incident is None:
-        raise HTTPException(status_code=404, detail="Incident not found.")
-    get_authorized_application(db, incident.application_id, x_api_key)
-    event_ids = db.scalars(
-        select(IncidentEvent.log_event_id).where(IncidentEvent.incident_id == incident_id)
-    ).all()
-    events = db.scalars(
-        select(LogEvent).where(LogEvent.id.in_(event_ids)).order_by(LogEvent.timestamp.asc())
-    ).all()
-    result = serialize_incident(incident)
-    result["events"] = [serialize_event(event) for event in events]
-    if incident.report:
-        result["report"] = serialize_report(incident.report)
-    return result
-
-
-@app.post("/api/incidents/{incident_id}/investigate")
-def legacy_trigger_investigation(
-    incident_id: int,
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    db: Session = Depends(get_db),
-):
-    incident = db.get(Incident, incident_id)
-    if incident is None:
-        raise HTTPException(status_code=404, detail="Incident not found.")
-    get_authorized_application(db, incident.application_id, x_api_key)
-    report = investigate_incident(db, incident)
-    return {"status": "completed", "report": serialize_report(report)}
-
-
-@app.patch("/api/incidents/{incident_id}/status")
-def legacy_update_incident_status(
-    incident_id: int,
-    status: str,
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    db: Session = Depends(get_db),
-):
-    valid_statuses = {"open", "investigating", "investigated", "resolved", "dismissed"}
-    if status not in valid_statuses:
-        raise HTTPException(status_code=400, detail=f"Invalid status. Use one of: {', '.join(valid_statuses)}")
-    incident = db.get(Incident, incident_id)
-    if incident is None:
-        raise HTTPException(status_code=404, detail="Incident not found.")
-    get_authorized_application(db, incident.application_id, x_api_key)
-    incident.status = status
-    db.commit()
-    return serialize_incident(incident)
-
-
-@app.get("/api/applications/{application_id}/stats")
-def legacy_application_stats(
-    application_id: str,
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    db: Session = Depends(get_db),
-):
-    get_authorized_application(db, application_id, x_api_key)
-    total_events = db.scalar(select(func.count(LogEvent.id)).where(LogEvent.application_id == application_id)) or 0
-    total_incidents = db.scalar(select(func.count(Incident.id)).where(Incident.application_id == application_id)) or 0
-    open_incidents = db.scalar(select(func.count(Incident.id)).where(Incident.application_id == application_id, Incident.status == "open")) or 0
-    investigated = db.scalar(select(func.count(Incident.id)).where(Incident.application_id == application_id, Incident.status == "investigated")) or 0
-    resolved = db.scalar(select(func.count(Incident.id)).where(Incident.application_id == application_id, Incident.status == "resolved")) or 0
-    return {
-        "total_events": total_events,
-        "total_incidents": total_incidents,
-        "open_incidents": open_incidents,
-        "investigated_incidents": investigated,
-        "resolved_incidents": resolved,
-    }
 
 
 # ---------------------------------------------------------------------------
 # Routes — Dashboard stats
 # ---------------------------------------------------------------------------
 
-@app.get("/api/dashboard/applications/{application_id}/stats")
+@app.get("/api/applications/{application_id}/stats")
 def get_application_stats(
     application_id: str,
-    current_user: User = Depends(require_dashboard_user),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     db: Session = Depends(get_db),
 ):
-    get_owned_application(db, application_id, current_user)
+    get_authorized_application(db, application_id, x_api_key)
 
     total_events = db.scalar(
         select(func.count(LogEvent.id))
@@ -1091,10 +1150,205 @@ def get_application_stats(
         )
     ) or 0
 
+    knowledge_docs = db.scalar(
+        select(func.count(KnowledgeDocument.id))
+        .where(KnowledgeDocument.application_id == application_id)
+    ) or 0
+
     return {
         "total_events": total_events,
         "total_incidents": total_incidents,
         "open_incidents": open_incidents,
         "investigated_incidents": investigated,
         "resolved_incidents": resolved,
+        "knowledge_documents": knowledge_docs,
     }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard knowledge-base lifecycle (pgvector, application scoped)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/dashboard/applications/{application_id}/knowledge")
+def dashboard_index_knowledge(application_id: str, payload: KnowledgeIndexRequest,
+                              user: User = Depends(require_csrf), db: Session = Depends(get_db)):
+    owned_application(db, application_id, user)
+    try:
+        from app.rag import index_document
+        return index_document(
+            db=db, application_id=application_id, title=payload.title.strip(),
+            content=payload.content, source_type=payload.source_type.strip() or "runbook",
+            source_uri=payload.source_uri, replace_existing=payload.replace_existing,
+        )
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=502, detail=f"Knowledge indexing failed: {str(exc)[:300]}")
+
+
+@app.get("/api/dashboard/applications/{application_id}/knowledge")
+def dashboard_list_knowledge(application_id: str, user: User = Depends(current_dashboard_user),
+                             db: Session = Depends(get_db)):
+    owned_application(db, application_id, user)
+    from app.rag import list_documents
+    return {"documents": list_documents(db, application_id)}
+
+
+@app.delete("/api/dashboard/applications/{application_id}/knowledge")
+def dashboard_delete_knowledge(application_id: str, title: str,
+                               user: User = Depends(require_csrf), db: Session = Depends(get_db)):
+    owned_application(db, application_id, user)
+    from app.rag import delete_document
+    return {"deleted_chunks": delete_document(db, application_id, title), "title": title}
+
+
+# ---------------------------------------------------------------------------
+# Routes — Knowledge Base
+# ---------------------------------------------------------------------------
+
+@app.post("/api/applications/{application_id}/knowledge")
+def create_knowledge_doc(
+    application_id: str,
+    payload: KnowledgeDocCreate,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    db: Session = Depends(get_db),
+):
+    get_authorized_application(db, application_id, x_api_key)
+
+    from app.knowledge import create_document
+
+    doc = create_document(
+        db=db,
+        application_id=application_id,
+        title=payload.title,
+        content=payload.content,
+        doc_type=payload.doc_type,
+        tags=payload.tags,
+    )
+
+    return serialize_knowledge_doc(doc)
+
+
+@app.get("/api/applications/{application_id}/knowledge")
+def list_knowledge_docs(
+    application_id: str,
+    doc_type: str | None = None,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    db: Session = Depends(get_db),
+):
+    get_authorized_application(db, application_id, x_api_key)
+
+    from app.knowledge import list_documents
+
+    docs = list_documents(db, application_id, doc_type=doc_type)
+    return {"documents": [serialize_knowledge_doc(d) for d in docs]}
+
+
+@app.get("/api/knowledge/{doc_id}")
+def get_knowledge_doc(
+    doc_id: int,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    db: Session = Depends(get_db),
+):
+    doc = db.get(KnowledgeDocument, doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    get_authorized_application(db, doc.application_id, x_api_key)
+    return serialize_knowledge_doc(doc)
+
+
+@app.put("/api/knowledge/{doc_id}")
+def update_knowledge_doc(
+    doc_id: int,
+    payload: KnowledgeDocUpdate,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    db: Session = Depends(get_db),
+):
+    doc = db.get(KnowledgeDocument, doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    get_authorized_application(db, doc.application_id, x_api_key)
+
+    from app.knowledge import update_document
+
+    updated = update_document(
+        db=db,
+        doc=doc,
+        title=payload.title,
+        content=payload.content,
+        doc_type=payload.doc_type,
+        tags=payload.tags,
+    )
+
+    return serialize_knowledge_doc(updated)
+
+
+@app.delete("/api/knowledge/{doc_id}")
+def delete_knowledge_doc(
+    doc_id: int,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    db: Session = Depends(get_db),
+):
+    doc = db.get(KnowledgeDocument, doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    get_authorized_application(db, doc.application_id, x_api_key)
+
+    from app.knowledge import delete_document
+    delete_document(db, doc)
+    return {"status": "deleted"}
+
+
+# ---------------------------------------------------------------------------
+# Routes — Evaluation
+# ---------------------------------------------------------------------------
+
+@app.post("/api/evaluation/cases")
+def create_eval_case(
+    payload: EvalCaseCreate,
+    user: User = Depends(require_csrf),
+    db: Session = Depends(get_db),
+):
+    from app.evaluation import create_evaluation_case
+
+    case = create_evaluation_case(
+        db=db,
+        name=payload.name,
+        description=payload.description,
+        events_json=payload.events_json,
+        expected_root_cause=payload.expected_root_cause,
+        expected_services=payload.expected_services,
+        expected_severity=payload.expected_severity,
+    )
+
+    return serialize_eval_case(case)
+
+
+@app.get("/api/evaluation/cases")
+def list_eval_cases(user: User = Depends(current_dashboard_user), db: Session = Depends(get_db)):
+    from app.evaluation import list_evaluation_cases
+
+    cases = list_evaluation_cases(db)
+    return {"cases": [serialize_eval_case(c) for c in cases]}
+
+
+@app.get("/api/evaluation/cases/{case_id}")
+def get_eval_case(case_id: int, user: User = Depends(current_dashboard_user), db: Session = Depends(get_db)):
+    case = db.get(EvaluationCase, case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found.")
+    return serialize_eval_case(case)
+
+
+@app.delete("/api/evaluation/cases/{case_id}")
+def delete_eval_case(case_id: int, user: User = Depends(require_csrf), db: Session = Depends(get_db)):
+    from app.evaluation import delete_evaluation_case
+
+    case = db.get(EvaluationCase, case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found.")
+
+    delete_evaluation_case(db, case)
+    return {"status": "deleted"}
